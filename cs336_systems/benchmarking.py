@@ -3,6 +3,7 @@ from cs336_basics.model import BasicsTransformerLM
 import torch
 import timeit
 import torch.cuda.nvtx as nvtx
+from contextlib import nullcontext
 
 # Model configs from Table 1
 MODEL_CONFIGS = {
@@ -28,6 +29,8 @@ def parse_args():
     parser.add_argument("--no-backward", action="store_true", help="Exclude backward pass from benchmarking")
     parser.add_argument("--profile", action="store_true", help="Add NVTX ranges for nsys profiling")
     parser.add_argument("--optimizer", action="store_true", help="Include optimizer step in benchmarking")
+    parser.add_argument("--mixed-precision", choices=["none", "fp16", "bf16"], default="none", help="Use mixed precision (fp16 or bf16)")
+    parser.add_argument("--memory-profile", action="store_true", help="Record and dump PyTorch memory history")
     return parser.parse_args()
 
 def init_model(d_model, d_ff, n_heads, n_layers, vocab_size, context_length, rope_theta):
@@ -46,14 +49,23 @@ def generate_batch(batch_size, seq_len, vocab_size):
     input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
     return input_ids
 
-def benchmark(model, batch_size, seq_len, vocab_size, warmup_steps, benchmark_steps, include_backward=False, include_optimizer=False, profile=False, optimizer=None):
+def benchmark(model, batch_size, seq_len, vocab_size, warmup_steps, benchmark_steps, include_backward=False, include_optimizer=False, profile=False, optimizer=None, mixed_precision="none", memory_profile=False):
 
     device = next(model.parameters()).device
     input_ids = generate_batch(batch_size, seq_len, vocab_size).to(device)
 
+    device_type = "cuda" if "cuda" in str(device) else "cpu"
+    if mixed_precision == "fp16" and device_type == "cuda":
+        ctx = torch.autocast(device_type=device_type, dtype=torch.float16)
+    elif mixed_precision == "bf16" and device_type == "cuda":
+        ctx = torch.autocast(device_type=device_type, dtype=torch.bfloat16)
+    else:
+        ctx = nullcontext()
+
     # Warmup
     for _ in range(warmup_steps):
-        logits = model(input_ids)
+        with ctx:
+            logits = model(input_ids)
         if include_backward:
             loss = logits.mean()
             loss.backward()
@@ -66,13 +78,17 @@ def benchmark(model, batch_size, seq_len, vocab_size, warmup_steps, benchmark_st
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
+    if memory_profile and torch.cuda.is_available():
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+
     # Benchmark
     times = []
     for _ in range(benchmark_steps):
         start = timeit.default_timer()
 
         if profile: nvtx.range_push("forward_pass")
-        logits = model(input_ids)
+        with ctx:
+            logits = model(input_ids)
         if profile: nvtx.range_pop()
 
         if include_backward:
@@ -97,6 +113,11 @@ def benchmark(model, batch_size, seq_len, vocab_size, warmup_steps, benchmark_st
         end = timeit.default_timer()
         times.append(end - start)
 
+    if memory_profile and torch.cuda.is_available():
+        torch.cuda.memory._dump_snapshot("memory_snapshot.pickle")
+        torch.cuda.memory._record_memory_history(enabled=None)
+        print("Memory snapshot saved to memory_snapshot.pickle")
+
     avg_time = sum(times) / len(times)
     return avg_time
 
@@ -108,7 +129,7 @@ if __name__ == "__main__":
     rope_theta = 100000.0
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    print(f"Benchmarking model-size={args.model_size}, batch-size={args.batch_size}, context-length={args.context_length}")
+    print(f"Benchmarking model-size={args.model_size}, batch-size={args.batch_size}, context-length={args.context_length}, mixed-precision={args.mixed_precision}")
 
     model = init_model(
         d_model=config["d_model"],
@@ -122,24 +143,31 @@ if __name__ == "__main__":
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3) if args.optimizer else None
 
-    if not args.profile:
+    if not args.profile and not args.memory_profile:
         avg_time_forward = benchmark(
             model, args.batch_size, args.context_length, vocab_size, 
-            args.warmup, args.steps, include_backward=False, include_optimizer=False, profile=False
+            args.warmup, args.steps, include_backward=False, include_optimizer=False, profile=False, mixed_precision=args.mixed_precision
         )
         print(f"Average forward pass time: {avg_time_forward:.4f} seconds")
 
         if not args.no_backward:
             avg_time_forward_backward = benchmark(
                 model, args.batch_size, args.context_length, vocab_size, 
-                args.warmup, args.steps, include_backward=True, include_optimizer=args.optimizer, profile=False, optimizer=optimizer
+                args.warmup, args.steps, include_backward=True, include_optimizer=args.optimizer, profile=False, optimizer=optimizer, mixed_precision=args.mixed_precision
             )
             step_type = "forward + backward + optimizer" if args.optimizer else "forward + backward"
             print(f"Average {step_type} pass time: {avg_time_forward_backward:.4f} seconds")
+    elif args.memory_profile:
+        print("Running in memory profiling mode. Will save trace to memory_snapshot.pickle.")
+        benchmark(
+            model, args.batch_size, args.context_length, vocab_size, 
+            args.warmup, args.steps, include_backward=not args.no_backward, include_optimizer=args.optimizer, profile=args.profile, optimizer=optimizer, mixed_precision=args.mixed_precision, memory_profile=True
+        )
+        print("Memory profiling complete.")
     else:
         print("Running in profiling mode. Run with `nsys profile -o result python cs336_systems/benchmarking.py --profile ...` to capture trace.")
         benchmark(
             model, args.batch_size, args.context_length, vocab_size, 
-            args.warmup, args.steps, include_backward=not args.no_backward, include_optimizer=args.optimizer, profile=True, optimizer=optimizer
+            args.warmup, args.steps, include_backward=not args.no_backward, include_optimizer=args.optimizer, profile=True, optimizer=optimizer, mixed_precision=args.mixed_precision
         )
         print("Profiling complete.")
