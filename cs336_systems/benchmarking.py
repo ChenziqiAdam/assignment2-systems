@@ -2,6 +2,7 @@ import argparse
 from cs336_basics.model import BasicsTransformerLM
 import torch
 import timeit
+import torch.cuda.nvtx as nvtx
 
 # Model configs from Table 1
 MODEL_CONFIGS = {
@@ -25,6 +26,8 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=5, help="Number of warmup steps")
     parser.add_argument("--steps", type=int, default=10, help="Number of benchmark steps")
     parser.add_argument("--no-backward", action="store_true", help="Exclude backward pass from benchmarking")
+    parser.add_argument("--profile", action="store_true", help="Add NVTX ranges for nsys profiling")
+    parser.add_argument("--optimizer", action="store_true", help="Include optimizer step in benchmarking")
     return parser.parse_args()
 
 def init_model(d_model, d_ff, n_heads, n_layers, vocab_size, context_length, rope_theta):
@@ -43,7 +46,7 @@ def generate_batch(batch_size, seq_len, vocab_size):
     input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
     return input_ids
 
-def benchmark(model, batch_size, seq_len, vocab_size, warmup_steps, benchmark_steps, include_backward=False):
+def benchmark(model, batch_size, seq_len, vocab_size, warmup_steps, benchmark_steps, include_backward=False, include_optimizer=False, profile=False, optimizer=None):
 
     device = next(model.parameters()).device
     input_ids = generate_batch(batch_size, seq_len, vocab_size).to(device)
@@ -54,7 +57,12 @@ def benchmark(model, batch_size, seq_len, vocab_size, warmup_steps, benchmark_st
         if include_backward:
             loss = logits.mean()
             loss.backward()
-            model.zero_grad()
+            if include_optimizer and optimizer is not None:
+                optimizer.step()
+            if optimizer is not None:
+                optimizer.zero_grad()
+            else:
+                model.zero_grad()
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
@@ -62,11 +70,28 @@ def benchmark(model, batch_size, seq_len, vocab_size, warmup_steps, benchmark_st
     times = []
     for _ in range(benchmark_steps):
         start = timeit.default_timer()
+
+        if profile: nvtx.range_push("forward_pass")
         logits = model(input_ids)
+        if profile: nvtx.range_pop()
+
         if include_backward:
             loss = logits.mean()
+
+            if profile: nvtx.range_push("backward_pass")
             loss.backward()
-            model.zero_grad()
+            if profile: nvtx.range_pop()
+
+            if include_optimizer and optimizer is not None:
+                if profile: nvtx.range_push("optimizer_step")
+                optimizer.step()
+                if profile: nvtx.range_pop()
+
+            if optimizer is not None:
+                optimizer.zero_grad()
+            else:
+                model.zero_grad()
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         end = timeit.default_timer()
@@ -95,16 +120,26 @@ if __name__ == "__main__":
         rope_theta=rope_theta
     ).to(device)
 
-    avg_time_forward = benchmark(
-        model, args.batch_size, args.context_length, vocab_size, 
-        args.warmup, args.steps, include_backward=False
-    )
-    print(f"Average forward pass time: {avg_time_forward:.4f} seconds")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3) if args.optimizer else None
 
-    if not args.no_backward:
-        avg_time_forward_backward = benchmark(
+    if not args.profile:
+        avg_time_forward = benchmark(
             model, args.batch_size, args.context_length, vocab_size, 
-            args.warmup, args.steps, include_backward=True
+            args.warmup, args.steps, include_backward=False, include_optimizer=False, profile=False
         )
-        print(f"Average forward + backward pass time: {avg_time_forward_backward:.4f} seconds")
-        print(f"Estimated average backward pass time: {avg_time_forward_backward - avg_time_forward:.4f} seconds")
+        print(f"Average forward pass time: {avg_time_forward:.4f} seconds")
+
+        if not args.no_backward:
+            avg_time_forward_backward = benchmark(
+                model, args.batch_size, args.context_length, vocab_size, 
+                args.warmup, args.steps, include_backward=True, include_optimizer=args.optimizer, profile=False, optimizer=optimizer
+            )
+            step_type = "forward + backward + optimizer" if args.optimizer else "forward + backward"
+            print(f"Average {step_type} pass time: {avg_time_forward_backward:.4f} seconds")
+    else:
+        print("Running in profiling mode. Run with `nsys profile -o result python cs336_systems/benchmarking.py --profile ...` to capture trace.")
+        benchmark(
+            model, args.batch_size, args.context_length, vocab_size, 
+            args.warmup, args.steps, include_backward=not args.no_backward, include_optimizer=args.optimizer, profile=True, optimizer=optimizer
+        )
+        print("Profiling complete.")
