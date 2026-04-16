@@ -1,10 +1,18 @@
-import cs336_basics
+from cs336_basics.model import BasicsTransformerLM
 import torch
 import torch
 import timeit
 
-def init_model(d_model, d_ff, n_heads, n_layers):
-    model = cs336_basics.model.BasicsTransformerLM(d_model=d_model, d_ff=d_ff, n_heads=n_heads, n_layers=n_layers)
+def init_model(d_model, d_ff, n_heads, n_layers, vocab_size, context_length, rope_theta):
+    model = BasicsTransformerLM(
+        d_model=d_model, 
+        d_ff=d_ff, 
+        num_heads=n_heads, 
+        num_layers=n_layers,
+        vocab_size=vocab_size,
+        context_length=context_length,
+        rope_theta=rope_theta
+    )
     return model
 
 def generate_batch(batch_size, seq_len, vocab_size):
@@ -49,10 +57,12 @@ if __name__ == "__main__":
     batch_size = 32
     seq_len = 128
     vocab_size = 10000
+    context_length = 128
+    rope_theta = 100000.0
     warmup_steps = 5
     benchmark_steps = 10
     
-    model = init_model(d_model, d_ff, n_heads, n_layers).cuda()
+    model = init_model(d_model, d_ff, n_heads, n_layers, vocab_size, context_length, rope_theta).cuda()
     
     avg_time_forward = benchmark(model, batch_size, seq_len, vocab_size, warmup_steps, benchmark_steps, include_backward=False)
     print(f"Average forward pass time: {avg_time_forward:.4f} seconds")
